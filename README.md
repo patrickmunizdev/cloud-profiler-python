@@ -16,7 +16,7 @@ information specific to Linux Alpine kernels, see
 
 ## Supported Python Versions
 
-Python >= 3.7 and <= 3.13
+Python >= 3.7 and <= 3.14
 
 ## Installation & usage
 

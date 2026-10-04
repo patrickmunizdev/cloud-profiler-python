@@ -13,6 +13,7 @@
 #define PY_311 0x030B0000  // 3.11
 #define PY_312 0x030C0000  // 3.12
 #define PY_313 0x030D0000  // 3.13
+#define PY_314 0x030E0000  // 3.14
 
 // Reads the current process's own memory through the kernel instead of
 // dereferencing the pointer directly. process_vm_readv reports an unmapped or
@@ -32,7 +33,110 @@ bool SafeCopy(void *dst, const void *src, size_t n) {
   return got == static_cast<long>(n);
 }
 
-#if PY_VERSION_HEX >= PY_313
+#if PY_VERSION_HEX >= PY_314
+
+/**
+ * Python 3.14 changes to the frame structure, relative to 3.13:
+ * - f_executable changed from PyObject* to _PyStackRef, a tagged pointer;
+ *   PyStackRef_AsPyObjectBorrow masks off the tag bits to recover the raw
+ *   pointer (Include/internal/pycore_stackref.h)
+ * - the _PyInterpreterFrame struct definition moved from pycore_frame.h to
+ *   pycore_interpframe_structs.h; the inline helpers (_PyFrame_GetCode,
+ *   _PyFrame_IsIncomplete, ...) live in pycore_interpframe.h
+ * - the frame owner enum gained FRAME_OWNED_BY_INTERPRETER, and
+ *   _PyFrame_IsIncomplete now treats owner >= FRAME_OWNED_BY_INTERPRETER
+ *   (i.e. INTERPRETER and CSTACK) as incomplete
+ * - tstate->current_frame remains the entry point (public in
+ *   cpython/pystate.h), as in 3.13
+ *
+ * Field layout verified against the CPython 3.14 headers listed above and
+ * cross-checked with the py-spy 3.14 support in
+ * https://github.com/benfred/py-spy/pull/833.
+ *
+ * The walk runs in the SIGPROF handler, which can interrupt the interpreter at
+ * any instruction -- including while a frame or its code object is being set up
+ * or torn down. Rather than dereferencing the chain (which faults on a stale or
+ * half-written pointer), every interpreter pointer is read with SafeCopy and
+ * the walk operates only on the local copies.
+ */
+
+// This walk assumes the GIL-enabled build: with Py_GIL_DISABLED, f_executable
+// can be a deferred (non-refcounted) reference and instr_ptr indexes
+// thread-local bytecode (tlbc_index), so the offsets computed here would be
+// wrong. Fail the build explicitly instead of producing corrupt profiles.
+#ifdef Py_GIL_DISABLED
+#error "google-cloud-profiler does not support Python 3.14 free-threaded " \
+       "(Py_GIL_DISABLED) builds yet."
+#endif
+
+#define Py_BUILD_CORE
+#include "internal/pycore_interpframe.h"
+#undef Py_BUILD_CORE
+
+// CPython 3.14 _PyFrame_GetCode, reimplemented over a frame copy: borrows the
+// raw pointer out of the f_executable _PyStackRef, then validates it is a
+// readable code object via SafeCopy (f_executable may also hold None).
+// Derived from Include/internal/pycore_interpframe.h (_PyFrame_GetCode).
+static PyCodeObject *FrameCode(const _PyInterpreterFrame *fr,
+                               PyCodeObject *code_copy) {
+  if (PyStackRef_IsNull(fr->f_executable)) {
+    return nullptr;
+  }
+  PyObject *executable = PyStackRef_AsPyObjectBorrow(fr->f_executable);
+  if (!SafeCopy(code_copy, executable, sizeof(*code_copy)) ||
+      Py_TYPE(reinterpret_cast<PyObject *>(code_copy)) != &PyCode_Type) {
+    return nullptr;
+  }
+  return reinterpret_cast<PyCodeObject *>(executable);
+}
+
+// CPython 3.14 _PyFrame_IsIncomplete, reimplemented over copies.
+// Derived from Include/internal/pycore_interpframe.h.
+static bool FrameIsIncomplete(const _PyInterpreterFrame *fr, PyCodeObject *code,
+                              const PyCodeObject *code_copy) {
+  if (fr->owner >= FRAME_OWNED_BY_INTERPRETER) {
+    return true;
+  }
+  if (fr->owner == FRAME_OWNED_BY_GENERATOR) {
+    return false;
+  }
+  if (code == nullptr) {
+    return true;
+  }
+  return fr->instr_ptr < _PyCode_CODE(code) + code_copy->_co_firsttraceable;
+}
+
+int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
+  if (ts == nullptr) {
+    frames[0].lineno = kNoPyState;
+    frames[0].py_code = nullptr;
+    return 1;
+  }
+
+  _PyInterpreterFrame *faddr = ts->current_frame;
+  int num_frames = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+    _PyInterpreterFrame fr;
+    if (!SafeCopy(&fr, faddr, sizeof(fr))) {
+      break;  // unreadable frame: stop, keep the frames gathered so far
+    }
+    PyCodeObject code_copy;
+    PyCodeObject *code = FrameCode(&fr, &code_copy);
+    if (code != nullptr && !FrameIsIncomplete(&fr, code, &code_copy)) {
+      // Defer line and name/filename resolution to PythonTraces (GIL held).
+      // lineno temporarily carries the instruction byte offset; PythonTraces
+      // turns it into a source line with PyCode_Addr2Line on the live object.
+      frames[num_frames].py_code = code;
+      frames[num_frames].lineno = static_cast<int>(
+          (fr.instr_ptr - _PyCode_CODE(code)) * sizeof(_Py_CODEUNIT));
+      num_frames++;
+    }
+    faddr = fr.previous;
+  }
+  return num_frames;
+}
+
+#elif PY_VERSION_HEX >= PY_313
 
 /**
  * Python 3.13 introduced significant changes to the frame structure:
