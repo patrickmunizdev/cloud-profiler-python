@@ -240,6 +240,14 @@ PyObject *Profiler::PythonTraces() {
              Py_TYPE(reinterpret_cast<PyObject *>(&code_check)) == &PyCode_Type)
                 ? PyCode_Addr2Line(pointer, frame.lineno)
                 : 0;
+        if (lineno < 0) {
+          // PyCode_Addr2Line returns -1 for a negative instruction offset,
+          // which a torn frame copy can carry (and which is also legitimate:
+          // a generator sampled before its first instruction retired has
+          // prev_instr pointing one code unit before the bytecode start --
+          // CPython's PyFrame_GetLine reports line 0 in that case).
+          lineno = 0;
+        }
       }
       PyObject *py_frame =
           Py_BuildValue("(ssi)", func_loc.name.c_str(),

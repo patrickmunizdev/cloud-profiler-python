@@ -33,6 +33,13 @@ bool SafeCopy(void *dst, const void *src, size_t n) {
   return got == static_cast<long>(n);
 }
 
+// Hard bound on frame-walk iterations. A torn read can produce a frame chain
+// that cycles (e.g. a frame whose previous points at its own address), and
+// skipped incomplete frames do not count toward kMaxFramesToCapture, so
+// without a step limit such a cycle would loop forever inside the SIGPROF
+// handler while holding the GIL, deadlocking the interpreter.
+const int kMaxFrameWalkSteps = 4 * kMaxFramesToCapture;
+
 #if PY_VERSION_HEX >= PY_314
 
 /**
@@ -115,7 +122,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
 
   _PyInterpreterFrame *faddr = ts->current_frame;
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int steps = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         steps < kMaxFrameWalkSteps) {
+    steps++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -130,6 +140,9 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       frames[num_frames].lineno = static_cast<int>(
           (fr.instr_ptr - _PyCode_CODE(code)) * sizeof(_Py_CODEUNIT));
       num_frames++;
+    }
+    if (fr.previous == faddr) {
+      break;  // self-referential chain from a torn read: stop the walk
     }
     faddr = fr.previous;
   }
@@ -196,7 +209,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
 
   _PyInterpreterFrame *faddr = ts->current_frame;
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int steps = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         steps < kMaxFrameWalkSteps) {
+    steps++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -211,6 +227,9 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       frames[num_frames].lineno = static_cast<int>(
           (fr.instr_ptr - _PyCode_CODE(code)) * sizeof(_Py_CODEUNIT));
       num_frames++;
+    }
+    if (fr.previous == faddr) {
+      break;  // self-referential chain from a torn read: stop the walk
     }
     faddr = fr.previous;
   }
@@ -278,7 +297,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
   }
 
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int steps = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         steps < kMaxFrameWalkSteps) {
+    steps++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -291,6 +313,9 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       frames[num_frames].lineno = static_cast<int>(
           (fr.prev_instr - _PyCode_CODE(fr.f_code)) * sizeof(_Py_CODEUNIT));
       num_frames++;
+    }
+    if (fr.previous == faddr) {
+      break;  // self-referential chain from a torn read: stop the walk
     }
     faddr = fr.previous;
   }
@@ -352,7 +377,10 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
   }
 
   int num_frames = 0;
-  while (faddr != nullptr && num_frames < kMaxFramesToCapture) {
+  int steps = 0;
+  while (faddr != nullptr && num_frames < kMaxFramesToCapture &&
+         steps < kMaxFrameWalkSteps) {
+    steps++;
     _PyInterpreterFrame fr;
     if (!SafeCopy(&fr, faddr, sizeof(fr))) {
       break;  // unreadable frame: stop, keep the frames gathered so far
@@ -365,6 +393,9 @@ int PopulateFrames(CallFrame *frames, PyThreadState *ts) {
       frames[num_frames].lineno = static_cast<int>(
           (fr.prev_instr - _PyCode_CODE(fr.f_code)) * sizeof(_Py_CODEUNIT));
       num_frames++;
+    }
+    if (fr.previous == faddr) {
+      break;  // self-referential chain from a torn read: stop the walk
     }
     faddr = fr.previous;
   }
